@@ -396,7 +396,7 @@ cancelled_checkout_out_test(_) ->
     % cancelled checkout should not return pending messages to queue
     {State2, _, _} = apply(meta(3), rabbit_fifo:make_checkout(Cid, cancel, #{}), State1),
     ?assertEqual(1, lqueue:len(State2#rabbit_fifo.messages)),
-    ?assertEqual(0, lqueue:len(State2#rabbit_fifo.returns)),
+    ?assertEqual(0, oqueue:len(State2#rabbit_fifo.returns)),
 
     {State3, {dequeue, empty}} =
         apply(meta(3), rabbit_fifo:make_checkout(Cid, {dequeue, settled}, #{}), State2),
@@ -452,13 +452,13 @@ down_with_noconnection_returns_unack_test(_) ->
     Cid = {<<"down_with_noconnect">>, Pid},
     {State0, _} = enq(1, 1, second, test_init(test)),
     ?assertEqual(1, lqueue:len(State0#rabbit_fifo.messages)),
-    ?assertEqual(0, lqueue:len(State0#rabbit_fifo.returns)),
+    ?assertEqual(0, oqueue:len(State0#rabbit_fifo.returns)),
     {State1, {_, _}} = deq(2, Cid, unsettled, State0),
     ?assertEqual(0, lqueue:len(State1#rabbit_fifo.messages)),
-    ?assertEqual(0, lqueue:len(State1#rabbit_fifo.returns)),
+    ?assertEqual(0, oqueue:len(State1#rabbit_fifo.returns)),
     {State2a, _, _} = apply(meta(3), {down, Pid, noconnection}, State1),
     ?assertEqual(0, lqueue:len(State2a#rabbit_fifo.messages)),
-    ?assertEqual(1, lqueue:len(State2a#rabbit_fifo.returns)),
+    ?assertEqual(1, oqueue:len(State2a#rabbit_fifo.returns)),
     ?assertMatch(#consumer{checked_out = Ch,
                            status = suspected_down}
                    when map_size(Ch) == 0,
@@ -665,7 +665,7 @@ down_noproc_returns_checked_out_in_order_test(_) ->
     ?assertEqual(100, maps:size(Checked)),
     %% simulate down
     {S, _, _} = apply(meta(102), {down, self(), noproc}, S2),
-    Returns = lqueue:to_list(S#rabbit_fifo.returns),
+    Returns = oqueue:to_list(S#rabbit_fifo.returns),
     ?assertEqual(100, length(Returns)),
     ?assertEqual(0, maps:size(S#rabbit_fifo.consumers)),
     %% validate returns are in order
@@ -686,7 +686,7 @@ down_noconnection_returns_checked_out_test(_) ->
     ?assertEqual(NumMsgs, maps:size(Checked)),
     %% simulate down
     {S, _, _} = apply(meta(102), {down, self(), noconnection}, S2),
-    Returns = lqueue:to_list(S#rabbit_fifo.returns),
+    Returns = oqueue:to_list(S#rabbit_fifo.returns),
     ?assertEqual(NumMsgs, length(Returns)),
     ?assertMatch(#consumer{checked_out = Ch}
                    when map_size(Ch) == 0,
@@ -898,7 +898,7 @@ single_active_returns_messages_on_noconnection_test(_) ->
     % simulate node goes down
     {State3, _, _} = apply(meta(5), {down, DownPid, noconnection}, State2),
     %% assert the consumer is up
-    ?assertMatch([_], lqueue:to_list(State3#rabbit_fifo.returns)),
+    ?assertMatch([_], oqueue:to_list(State3#rabbit_fifo.returns)),
     ?assertMatch([{_, #consumer{checked_out = Checked}}]
                  when map_size(Checked) == 0,
                       State3#rabbit_fifo.waiting_consumers),
