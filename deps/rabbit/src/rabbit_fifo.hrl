@@ -173,7 +173,7 @@
          % rabbit_fifo_index can be slow when calculating the smallest
          % index when there are large gaps but should be faster than gb_trees
          % for normal appending operations as it's backed by a map
-         ra_indexes = rabbit_fifo_index:empty() :: rabbit_fifo_index:state(),
+         ra_indexes = oqueue:new() :: oqueue:oqueue(),
          release_cursors = lqueue:new() :: lqueue:lqueue({release_cursor,
                                                           ra:index(), #rabbit_fifo{}}),
          % consumers need to reflect consumer state at time of snapshot

@@ -23,6 +23,8 @@ all() ->
 all_tests() ->
     [
      basics,
+     delete,
+     delete_front,
      order
     ].
 
@@ -68,17 +70,42 @@ basics(_Confg) ->
     ?assertMatch({{value, 0}, _}, oqueue:out(Q4)),
     ok.
 
+
+delete(_Config) ->
+    Q0 = enq_list([1,2,3], oqueue:new()),
+    Q1 = oqueue:delete(2, Q0),
+    {error, not_found} = oqueue:delete(4, Q0),
+    ?assertEqual(2, oqueue:len(Q1)),
+    ?assertEqual([1,3], oqueue:to_list(Q1)),
+    ok.
+
+delete_front(_Config) ->
+    Q0 = enq_list([1,2,3,4], oqueue:new()),
+    %% this ensures there is a front
+    {_, Q1}  = oqueue:out(Q0),
+    {error, not_found} = oqueue:delete(1, Q1),
+    Q2 = oqueue:delete(3, Q1),
+    ?assertEqual(2, oqueue:len(Q2)),
+    ?assertEqual([2,4], oqueue:to_list(Q2)),
+
+    Q3 = oqueue:in(5, Q1),
+    Q4 = oqueue:delete(3, Q3),
+    ?assertEqual(3, oqueue:len(Q4)),
+    ?assertEqual([2,4, 5], oqueue:to_list(Q4)),
+    ok.
+
 order(_Config) ->
     run_proper(
       fun () ->
               ?FORALL(Ops, list(
                              frequency([
                                         {5, non_neg_integer()},
-                                        {1, deq}
+                                        {1, deq},
+                                        {2, {del, non_neg_integer()}}
                                        ])
                             ),
                       order_prop(Ops))
-      end, [], 5000).
+      end, [], 20000).
 
 order_prop(Ops0) ->
     % ct:pal("Ops ~w", [Ops0]),
@@ -93,6 +120,13 @@ enq_list([], Q) ->
 enq_list([deq | T], Q0) ->
     {_, Q} = oqueue:out(Q0),
     enq_list(T, Q);
+enq_list([{del, I} | T], Q0) ->
+    case oqueue:delete(I, Q0) of
+        {error, not_found} ->
+            enq_list(T, Q0);
+        Q ->
+            enq_list(T, Q)
+    end;
 enq_list([H | T], Q) ->
     enq_list(T, oqueue:in(H, Q)).
 
@@ -110,6 +144,8 @@ run_queue([], Q) ->
     Q;
 run_queue([deq | T], Q) ->
     run_queue(T, drop_head(Q));
+run_queue([{del, I} | T], Q) ->
+    run_queue(T, lists:delete(I, Q));
 run_queue([I | T], Q) ->
     run_queue(T, insert(I, Q)).
 
