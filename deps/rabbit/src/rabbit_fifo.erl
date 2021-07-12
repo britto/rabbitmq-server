@@ -357,26 +357,30 @@ apply(#{index := Index}, #purge{},
     Total = messages_ready(State0),
     %% TODO: add an optimised version of oqueue:delete that takes a list
     %% of items
-    Indexes1 = lists:foldl(fun (?INDEX_MSG(I, _), Acc0) ->
+    Indexes1 = lists:foldl(fun (?INDEX_MSG(I, _), Acc0) when is_integer(I) ->
                                    case oqueue:delete(I, Acc0) of
                                        {error, not_found} ->
                                            Acc0;
                                        Acc ->
                                            Acc
-                                   end
-                           end, Indexes0, oqueue:to_list(Returns)),
-    Indexes = lists:foldl(fun (?INDEX_MSG(I, _), Acc0) ->
-                                   case oqueue:delete(I, Acc0) of
-                                       {error, not_found} ->
-                                           Acc0;
-                                       Acc ->
-                                           Acc
-                                   end
-                           end, Indexes1, lqueue:to_list(Messages)),
+                                   end;
+                               (_, Acc) ->
+                                   Acc
+                           end, Indexes0, lqueue:to_list(Returns)),
+    Indexes = lists:foldl(fun (?INDEX_MSG(I, _), Acc0) when is_integer(I) ->
+                                  case oqueue:delete(I, Acc0) of
+                                      {error, not_found} ->
+                                          Acc0;
+                                      Acc ->
+                                          Acc
+                                  end;
+                              (_, Acc) ->
+                                  Acc
+                          end, Indexes1, lqueue:to_list(Messages)),
 
     State1 = State0#?MODULE{ra_indexes = Indexes,
                             messages = lqueue:new(),
-                            returns = oqueue:new(),
+                            returns = lqueue:new(),
                             msg_bytes_enqueue = 0,
                             prefix_msgs = {0, [], 0, []},
                             msg_bytes_in_memory = 0,
@@ -588,12 +592,13 @@ convert_v0_to_v1(V0State0) ->
             }.
 
 convert_v1_to_v2(V1State) ->
-    ReturnsV1 = rabbit_fifo_v1:get_field(returns, V1State),
+    % ReturnsV1 = rabbit_fifo_v1:get_field(returns, V1State),
     %% TODO: convert existing index to v2 index
     IndexesV2 = oqueue:new(),
-    V1State#?MODULE{ra_indexes = IndexesV2,
+    V1State#?MODULE{ra_indexes = IndexesV2
                     %% this is wrong
-                    returns = oqueue:from_list(lqueue:to_list(ReturnsV1))}.
+                    % returns = oqueue:from_list(lqueue:to_list(ReturnsV1))
+                   }.
 
 purge_node(Meta, Node, State, Effects) ->
     lists:foldl(fun(Pid, {S0, E0}) ->
@@ -752,7 +757,7 @@ overview(#?MODULE{consumers = Cons,
              expires => Cfg#cfg.expires,
              delivery_limit => Cfg#cfg.delivery_limit
              },
-    Smallest = smallest_raft_index(State),
+    {Smallest, _} = smallest_raft_index(State),
     #{type => ?MODULE,
       config => Conf,
       num_consumers => maps:size(Cons),
@@ -761,7 +766,7 @@ overview(#?MODULE{consumers = Cons,
       num_ready_messages => messages_ready(State),
       num_messages => messages_total(State),
       num_release_cursors => lqueue:len(Cursors),
-      release_cursors => [{I, messages_total(S)} || {_, I, S} <- lqueue:to_list(Cursors)],
+      release_cursors => [{I, messages_total(S), query_peek(1, S)} || {_, I, S} <- lqueue:to_list(Cursors)],
       release_cursor_enqueue_counter => EnqCount,
       enqueue_message_bytes => EnqueueBytes,
       checkout_message_bytes => CheckoutBytes,
@@ -1020,7 +1025,7 @@ usage(Name) when is_atom(Name) ->
 messages_ready(#?MODULE{messages = M,
                         prefix_msgs = {RCnt, _R, PCnt, _P},
                         returns = R}) ->
-    lqueue:len(M) + oqueue:len(R) + RCnt + PCnt.
+    lqueue:len(M) + lqueue:len(R) + RCnt + PCnt.
 
 messages_total(#?MODULE{ra_indexes = Indexes,
                         prefix_msgs = {RCnt, _R, PCnt, _P}}) ->
@@ -1187,10 +1192,10 @@ apply_enqueue(#{index := RaftIdx} = Meta, From, Seq, RawMsg, State0) ->
 
 drop_head(#?MODULE{ra_indexes = Indexes0} = State0, Effects0) ->
     case take_next_msg(State0) of
-        {?INDEX_MSG(_Idx, ?PREFIX_MEM_MSG(Header)), State1} ->
+        {?PREFIX_MEM_MSG(Header), State1} ->
             State2 = subtract_in_memory_counts(Header, add_bytes_drop(Header, State1)),
             {State2, Effects0};
-        {?INDEX_MSG(_Idx, ?PREFIX_DISK_MSG(Header)), State1} ->
+        {?DISK_MSG(Header), State1} ->
             State2 = add_bytes_drop(Header, State1),
             {State2, Effects0};
         {?INDEX_MSG(Idx, ?MSG(Header, _) = Msg) = FullMsg,
@@ -1203,7 +1208,8 @@ drop_head(#?MODULE{ra_indexes = Indexes0} = State0, Effects0) ->
             State2 = add_bytes_drop(Header, State1),
             State = case Msg of
                         ?DISK_MSG(_) -> State2;
-                        _ -> subtract_in_memory_counts(Header, State2)
+                        _ ->
+                            subtract_in_memory_counts(Header, State2)
                     end,
             Effects = dead_letter_effects(maxlen, #{none => FullMsg},
                                           State, Effects0),
@@ -1346,22 +1352,20 @@ complete(Meta, ConsumerId, DiscardedMsgIds,
     Con = Con0#consumer{checked_out = maps:without(DiscardedMsgIds, Checked),
                         credit = increase_credit(Con0, map_size(Discarded))},
     State1 = update_or_remove_sub(Meta, ConsumerId, Con, State0),
-    %% TODO: optimise
-    Indexes = maps:fold(fun (_, ?INDEX_MSG(I, _), Acc0) ->
+    %% TODO: optimise by passing a list to oqueue
+    Indexes = maps:fold(fun (_, ?INDEX_MSG(I, _), Acc0) when is_integer(I) ->
                                 case oqueue:delete(I, Acc0) of
                                     {error, not_found} ->
                                         Acc0;
                                     Acc ->
                                         Acc
-                                end
+                                end;
+                            (_, _, Acc) ->
+                                Acc
                         end, Indexes0, Discarded),
-    State2 = maps:fold(fun
-                           (_, ?INDEX_MSG(_, ?PREFIX_MEM_MSG(Header)), Acc) ->
-                               add_bytes_settle(Header, Acc);
-                           (_, ?INDEX_MSG(_, ?PREFIX_DISK_MSG(Header)), Acc) ->
-                               add_bytes_settle(Header, Acc);
-                           (_, ?INDEX_MSG(_, ?MSG(Header, _)), Acc) ->
-                               add_bytes_settle(Header, Acc)
+    State2 = maps:fold(fun(_, Msg, Acc) ->
+                               add_bytes_settle(
+                                 get_msg_header(Msg), Acc)
                        end, State1, Discarded),
     {State2#?MODULE{ra_indexes = Indexes}, Effects}.
 
@@ -1424,10 +1428,10 @@ update_smallest_raft_index(Idx, State, Effects) ->
 
 update_smallest_raft_index(IncomingRaftIdx, Reply,
                            #?MODULE{cfg = Cfg,
-                                    release_cursors = Cursors0} = State0,
+                                    release_cursors = Cursors0} = State00,
                            Effects) ->
     %% TODO: optimise
-    Smallest = smallest_raft_index(State0),
+    {Smallest, State0} = smallest_raft_index(State00),
     Total = messages_total(State0),
     case Smallest of
         undefined when Total == 0 ->
@@ -1475,84 +1479,96 @@ find_next_cursor(Smallest, Cursors0, Potential) ->
             {Potential, Cursors0}
     end.
 
+update_msg_header(Key, Fun, Def, ?INDEX_MSG(Idx, ?MSG(Header, Body))) ->
+    ?INDEX_MSG(Idx, ?MSG(update_header(Key, Fun, Def, Header), Body));
+update_msg_header(Key, Fun, Def, ?DISK_MSG(Header)) ->
+    ?DISK_MSG(update_header(Key, Fun, Def, Header));
+update_msg_header(Key, Fun, Def, ?PREFIX_MEM_MSG(Header)) ->
+    ?PREFIX_MEM_MSG(update_header(Key, Fun, Def, Header)).
+
 update_header(Key, UpdateFun, Default, Header)
   when is_integer(Header) ->
     update_header(Key, UpdateFun, Default, #{size => Header});
 update_header(Key, UpdateFun, Default, Header) ->
     maps:update_with(Key, UpdateFun, Default, Header).
 
+% get_msg_header(Key, ?INDEX_MSG(_Idx, ?MSG(Header, _Body))) ->
+%     get_header(Key, Header);
+% get_msg_header(Key, ?DISK_MSG(Header)) ->
+%     get_header(Key, Header);
+% get_msg_header(Key, ?PREFIX_MEM_MSG(Header)) ->
+%     get_header(Key, Header).
 
-return_one(Meta, MsgId, ?INDEX_MSG(Idx, ?TUPLE(Tag, Header0)),
-           #?MODULE{returns = Returns,
-                    consumers = Consumers,
-                    cfg = #cfg{delivery_limit = DeliveryLimit}} = State0,
-           Effects0, ConsumerId)
-  when Tag == ?PREFIX_DISK_MSG_TAG; Tag == ?PREFIX_MEM_MSG_TAG ->
-    #consumer{checked_out = Checked} = Con0 = maps:get(ConsumerId, Consumers),
-    Header = update_header(delivery_count, fun (C) -> C+1 end, 1, Header0),
-    case maps:get(delivery_count, Header) of
-        DeliveryCount when DeliveryCount > DeliveryLimit ->
-            complete(Meta, ConsumerId, [MsgId], Con0, Effects0, State0);
-        _ ->
-            Msg0 = ?INDEX_MSG(Idx, ?TUPLE(Tag, Header)),
-            %% this should not affect the release cursor in any way
-            Con = Con0#consumer{checked_out = maps:remove(MsgId, Checked)},
-            {Msg, State1} = case Tag of
-                                ?PREFIX_DISK_MSG_TAG ->
-                                    {Msg0, State0};
-                                _ -> case evaluate_memory_limit(Header, State0) of
-                                         true ->
-                                             {?INDEX_MSG(Idx, ?PREFIX_DISK_MSG(Header)), State0};
-                                         false ->
-                                             {Msg0, add_in_memory_counts(Header, State0)}
-                                     end
-                            end,
-            {add_bytes_return(
-               Header,
-               State1#?MODULE{consumers = Consumers#{ConsumerId => Con},
-                              returns = oqueue:in(Msg, Returns)}),
-             Effects0}
-    end;
-return_one(Meta, MsgId, ?INDEX_MSG(RaftId, ?MSG(Header0, RawMsg) = Msg0),
+get_msg_header(?INDEX_MSG(_Idx, ?MSG(Header, _Body))) ->
+    Header;
+get_msg_header(?DISK_MSG(Header)) ->
+    Header;
+get_msg_header(?PREFIX_MEM_MSG(Header)) ->
+    Header.
+
+get_header(size, Header)
+  when is_integer(Header) ->
+    Header;
+get_header(_Key, Header) when is_integer(Header) ->
+    undefined;
+get_header(Key, Header) when is_map(Header) ->
+    maps:get(Key, Header, undefined).
+
+return_one(Meta, MsgId, Msg0,
            #?MODULE{returns = Returns,
                     consumers = Consumers,
                     cfg = #cfg{delivery_limit = DeliveryLimit}} = State0,
            Effects0, ConsumerId) ->
     #consumer{checked_out = Checked} = Con0 = maps:get(ConsumerId, Consumers),
-    Header = update_header(delivery_count, fun (C) -> C + 1 end, 1, Header0),
-    IdxMsg0 = ?INDEX_MSG(RaftId, ?MSG(Header, RawMsg)),
-    case maps:get(delivery_count, Header) of
+    Msg = update_msg_header(delivery_count, fun (C) -> C + 1 end, 1, Msg0),
+    Header = get_msg_header(Msg),
+    case get_header(delivery_count, Header) of
         DeliveryCount when DeliveryCount > DeliveryLimit ->
-            Effects = dead_letter_effects(delivery_limit, #{none => IdxMsg0},
+            %% TODO: don't do for prefix msgs
+            Effects = dead_letter_effects(delivery_limit, #{none => Msg},
                                           State0, Effects0),
             complete(Meta, ConsumerId, [MsgId], Con0, Effects, State0);
         _ ->
             Con = Con0#consumer{checked_out = maps:remove(MsgId, Checked)},
-            %% this should not affect the release cursor in any way
-            {RtnMsg, State1} = case Msg0 of
-                                   ?DISK_MSG(_) ->
-                                       {IdxMsg0, State0};
-                                   _ ->
+
+            {RtnMsg, State1} = case is_disk_msg(Msg) of
+                                   true ->
+                                       {Msg, State0};
+                                   false ->
                                        case evaluate_memory_limit(Header, State0) of
                                            true ->
-                                               {?INDEX_MSG(RaftId, ?DISK_MSG(Header)), State0};
+                                               {to_disk_msg(Msg), State0};
                                            false ->
-                                               {IdxMsg0, add_in_memory_counts(Header, State0)}
+                                               {Msg, add_in_memory_counts(Header, State0)}
                                        end
                                end,
             {add_bytes_return(
                Header,
                State1#?MODULE{consumers = Consumers#{ConsumerId => Con},
-                              returns = oqueue:in(RtnMsg, Returns)}),
+                              returns = lqueue:in(RtnMsg, Returns)}),
              Effects0}
     end.
+
+is_disk_msg(?INDEX_MSG(RaftIdx, ?DISK_MSG(_))) when is_integer(RaftIdx) ->
+    true;
+is_disk_msg(?DISK_MSG(_)) ->
+    true;
+is_disk_msg(_) ->
+    false.
+
+to_disk_msg(?INDEX_MSG(RaftIdx, ?DISK_MSG(_)) = Msg) when is_integer(RaftIdx) ->
+    Msg;
+to_disk_msg(?INDEX_MSG(RaftIdx, ?MSG(Header, _))) when is_integer(RaftIdx) ->
+    ?INDEX_MSG(RaftIdx, ?DISK_MSG(Header));
+to_disk_msg(?PREFIX_MEM_MSG(Header)) ->
+    ?DISK_MSG(Header).
 
 return_all(Meta, #?MODULE{consumers = Cons} = State0, Effects0, ConsumerId,
            #consumer{checked_out = Checked} = Con) ->
     State = State0#?MODULE{consumers = Cons#{ConsumerId => Con}},
-    maps:fold(fun (MsgId, Msg, {S, E}) ->
-                      return_one(Meta, MsgId, Msg, S, E, ConsumerId)
-              end, {State, Effects0}, Checked).
+    lists:foldl(fun ({MsgId, Msg}, {S, E}) ->
+                        return_one(Meta, MsgId, Msg, S, E, ConsumerId)
+                end, {State, Effects0}, lists:sort(maps:to_list(Checked))).
 
 %% checkout new messages to consumers
 checkout(Meta, OldState, State, Effects) ->
@@ -1583,7 +1599,7 @@ checkout(#{index := Index} = Meta, #?MODULE{cfg = #cfg{resource = QName}} = OldS
 
 checkout0(Meta, {success, ConsumerId, MsgId,
                  ?INDEX_MSG(RaftIdx, ?DISK_MSG(Header)), State},
-          Effects, SendAcc0) ->
+          Effects, SendAcc0) when is_integer(RaftIdx) ->
     DelMsg = {RaftIdx, {MsgId, Header}},
     SendAcc = maps:update_with(ConsumerId,
                            fun ({InMem, LogMsgs}) ->
@@ -1591,13 +1607,16 @@ checkout0(Meta, {success, ConsumerId, MsgId,
                            end, {[], [DelMsg]}, SendAcc0),
     checkout0(Meta, checkout_one(Meta, State), Effects, SendAcc);
 checkout0(Meta, {success, ConsumerId, MsgId,
-                 ?INDEX_MSG(_, ?MSG(Header, Msg)), State}, Effects,
-          SendAcc0) ->
+                 ?INDEX_MSG(Idx, ?MSG(Header, Msg)), State}, Effects,
+          SendAcc0) when is_integer(Idx) ->
     DelMsg = {MsgId, {Header, Msg}},
     SendAcc = maps:update_with(ConsumerId,
                            fun ({InMem, LogMsgs}) ->
                                    {[DelMsg | InMem], LogMsgs}
                            end, {[DelMsg], []}, SendAcc0),
+    checkout0(Meta, checkout_one(Meta, State), Effects, SendAcc);
+checkout0(Meta, {success, _ConsumerId, _MsgId, ?TUPLE(_, _), State}, Effects,
+          SendAcc) ->
     checkout0(Meta, checkout_one(Meta, State), Effects, SendAcc);
 checkout0(_Meta, {Activity, State0}, Effects0, SendAcc) ->
     Effects1 = case Activity of
@@ -1667,12 +1686,12 @@ evaluate_memory_limit(_Header,
     false;
 evaluate_memory_limit(#{size := Size}, State) ->
     evaluate_memory_limit(Size, State);
-evaluate_memory_limit(Size,
+evaluate_memory_limit(Header,
                       #?MODULE{cfg = #cfg{max_in_memory_length = MaxLength,
                                           max_in_memory_bytes = MaxBytes},
                                msg_bytes_in_memory = Bytes,
-                               msgs_ready_in_memory = Length})
-  when is_integer(Size) ->
+                               msgs_ready_in_memory = Length}) ->
+    Size = get_header(size, Header),
     (Length >= MaxLength) orelse ((Bytes + Size) > MaxBytes).
 
 append_delivery_effects(Effects0, AccMap) when map_size(AccMap) == 0 ->
@@ -1692,28 +1711,14 @@ append_delivery_effects(Effects0, AccMap) ->
 %%
 %% When we return it is always done to the current return queue
 %% for both prefix messages and current messages
-take_next_msg(#?MODULE{prefix_msgs = {R, P}} = State) ->
-    %% conversion
-    take_next_msg(State#?MODULE{prefix_msgs = {length(R), R, length(P), P}});
-take_next_msg(#?MODULE{prefix_msgs = {NumR, [?INDEX_MSG(Idx, _) = Msg | Rem],
-                                      NumP, P}} = State) when is_integer(Idx) ->
+take_next_msg(#?MODULE{prefix_msgs = {NumR, [Msg | Rem],
+                                      NumP, P}} = State) ->
     %% there are prefix returns, these should be served first
     {Msg, State#?MODULE{prefix_msgs = {NumR-1, Rem, NumP, P}}};
-% take_next_msg(#?MODULE{prefix_msgs = {NumR, [Header | Rem], NumP, P}} = State)
-%   when is_integer(Header) orelse is_map(Header) ->
-%     %% there are prefix returns, these should be served first
-%     {?PREFIX_MEM_MSG(Header),
-%      State#?MODULE{prefix_msgs = {NumR-1, Rem, NumP, P}}};
 take_next_msg(#?MODULE{returns = Returns0,
                        messages = Messages0,
                        prefix_msgs = {NumR, R, NumP, P}} = State) ->
-    %% TODO: use peek rather than out there as the most likely case is an empty
-    %% queue
-    case oqueue:out(Returns0) of
-        % {{value, ?INDEX_MSG(_, ?PREFIX_DISK_MSG(_) = NextMsg)}, Returns} ->
-        %     {NextMsg, State#?MODULE{returns = Returns}};
-        % {{value, ?INDEX_MSG(_, ?PREFIX_MEM_MSG(_) = NextMsg)}, Returns} ->
-        %     {NextMsg, State#?MODULE{returns = Returns}};
+    case lqueue:out(Returns0) of
         {{value, NextMsg}, Returns} ->
             {NextMsg, State#?MODULE{returns = Returns}};
         {empty, _} when P == [] ->
@@ -1724,25 +1729,12 @@ take_next_msg(#?MODULE{returns = Returns0,
                     {IndexMsg, State#?MODULE{messages = Messages}}
             end;
         {empty, _} ->
-            %% compacted format
             case P of
-                [?INDEX_MSG(_, ?PREFIX_DISK_MSG(_Header)) = Msg | Rem] ->
+                [?PREFIX_MEM_MSG(_Header) = Msg | Rem] ->
                     {Msg, State#?MODULE{prefix_msgs = {NumR, R, NumP-1, Rem}}};
-                [?INDEX_MSG(_, ?DISK_MSG(_Header)) = Msg | Rem] ->
-                    {Msg, State#?MODULE{prefix_msgs = {NumR, R, NumP-1, Rem}}};
-                [?TUPLE(Idx, Header) | Rem] ->
-                    {?INDEX_MSG(Idx, ?PREFIX_MEM_MSG(Header)),
-                     State#?MODULE{prefix_msgs = {NumR, R, NumP-1, Rem}}}
+                [?DISK_MSG(_Header) = Msg | Rem] ->
+                    {Msg, State#?MODULE{prefix_msgs = {NumR, R, NumP-1, Rem}}}
             end
-            % case Msg of
-            %     ?DISK_MSG(Header) ->
-            %         %% There are prefix msgs
-            %         {?PREFIX_DISK_MSG(Header),
-            %          State#?MODULE{prefix_msgs = {NumR, R, NumP-1, Rem}}};
-            %     Header ->
-            %         {?PREFIX_MEM_MSG(Header),
-            %          State#?MODULE{prefix_msgs = {NumR, R, NumP-1, Rem}}}
-            % end
     end.
 
 delivery_effect({CTag, CPid}, [], InMemMsgs) ->
@@ -1800,21 +1792,16 @@ checkout_one(Meta, #?MODULE{service_queue = SQ0,
                                                 next_msg_id = Next + 1,
                                                 credit = Credit - 1,
                                                 delivery_count = DelCnt + 1},
-                            State1 = update_or_remove_sub(Meta,
-                                       ConsumerId, Con,
+                            State1 = update_or_remove_sub(
+                                       Meta, ConsumerId, Con,
                                        State0#?MODULE{service_queue = SQ1}),
-                            State = case ConsumerMsg of
-                                        ?INDEX_MSG(_, ?PREFIX_MEM_MSG(Header)) ->
-                                            subtract_in_memory_counts(
-                                              Header, add_bytes_checkout(Header, State1));
-                                        ?INDEX_MSG(_, ?PREFIX_DISK_MSG(Header)) ->
+                            Header = get_msg_header(ConsumerMsg),
+                            State = case is_disk_msg(ConsumerMsg) of
+                                        true ->
                                             add_bytes_checkout(Header, State1);
-                                        ?INDEX_MSG(_, ?DISK_MSG(Header)) ->
-                                            add_bytes_checkout(Header, State1);
-                                        ?INDEX_MSG(_, ?MSG(Header, _)) ->
+                                        false ->
                                             subtract_in_memory_counts(
-                                              Header,
-                                              add_bytes_checkout(Header, State1))
+                                              Header, add_bytes_checkout(Header, State1))
                                     end,
                             {success, ConsumerId, Next, ConsumerMsg, State};
                         error ->
@@ -1922,16 +1909,27 @@ maybe_queue_consumer(ConsumerId, #consumer{credit = Credit} = Con,
 
 %% creates a dehydrated version of the current state to be cached and
 %% potentially used to for a snaphot at a later point
+dehydrate_state(#?MODULE{msg_bytes_in_memory = 0,
+                         cfg = #cfg{max_length = 0},
+                         consumers = Consumers} = State) ->
+    %% no messages are kept in memory, no need to
+    %% overly mutate the current state apart from removing indexes and cursors
+    State#?MODULE{
+                  ra_indexes = oqueue:new(),
+                  consumers = maps:map(fun (_, C) ->
+                                               dehydrate_consumer(C)
+                                       end, Consumers),
+                  release_cursors = lqueue:new()};
 dehydrate_state(#?MODULE{messages = Messages,
                          consumers = Consumers,
                          returns = Returns,
                          prefix_msgs = {PRCnt, PrefRet0, PPCnt, PrefMsg0},
                          waiting_consumers = Waiting0} = State) ->
-    RCnt = oqueue:len(Returns),
+    RCnt = lqueue:len(Returns),
     %% TODO: optimise this function as far as possible
     PrefRet1 = lists:foldr(fun (M, Acc) ->
                                    [dehydrate_message(M) | Acc]
-                           end, [], oqueue:to_list(Returns)),
+                           end, [], lqueue:to_list(Returns)),
     PrefRet = PrefRet0 ++ PrefRet1,
     PrefMsgsSuff = dehydrate_messages(Messages),
     %% prefix messages are not populated in normal operation only after
@@ -1944,19 +1942,16 @@ dehydrate_state(#?MODULE{messages = Messages,
                   consumers = maps:map(fun (_, C) ->
                                                dehydrate_consumer(C)
                                        end, Consumers),
-                  returns = oqueue:new(),
+                  returns = lqueue:new(),
                   prefix_msgs = {PRCnt + RCnt, PrefRet,
                                  PPCnt + lqueue:len(Messages), PrefMsgs},
                   waiting_consumers = Waiting}.
 
-%% TODO make body recursive to avoid allocating lists:reverse call
 dehydrate_messages(Msgs0)  ->
     {OutRes, Msgs} = lqueue:out(Msgs0),
     case OutRes of
-        {value, ?INDEX_MSG(_Idx, ?DISK_MSG(_)) = Msg} ->
-            [Msg | dehydrate_messages(Msgs)];
-        {value, ?INDEX_MSG(Idx, ?MSG(Header, _))} ->
-            [?TUPLE(Idx, Header) | dehydrate_messages(Msgs)];
+        {value, Msg} ->
+            [dehydrate_message(Msg) | dehydrate_messages(Msgs)];
         empty ->
             []
     end.
@@ -1967,16 +1962,15 @@ dehydrate_consumer(#consumer{checked_out = Checked0} = Con) ->
                        end, Checked0),
     Con#consumer{checked_out = Checked}.
 
-dehydrate_message(?INDEX_MSG(_, ?PREFIX_MEM_MSG(_)) = M) ->
+dehydrate_message(?PREFIX_MEM_MSG(_) = M) ->
     M;
-dehydrate_message(?INDEX_MSG(_, ?PREFIX_DISK_MSG(_)) = M) ->
+dehydrate_message(?DISK_MSG(_) = M) ->
     M;
-dehydrate_message(?INDEX_MSG(Idx, ?DISK_MSG(Header))) ->
-    %% TODO: more compact representation here? [Idx | Headers]
-    ?INDEX_MSG(Idx, ?PREFIX_DISK_MSG(Header));
-    % M;
-dehydrate_message(?INDEX_MSG(Idx, ?MSG(Header, _))) ->
-    ?INDEX_MSG(Idx, ?PREFIX_MEM_MSG(Header)).
+dehydrate_message(?INDEX_MSG(_Idx, ?DISK_MSG(_Header) = Msg)) ->
+    %% use disk msgs directly as prefix messages
+    Msg;
+dehydrate_message(?INDEX_MSG(Idx, ?MSG(Header, _))) when is_integer(Idx) ->
+    ?PREFIX_MEM_MSG(Header).
 
 %% make the state suitable for equality comparison
 normalize(#?MODULE{ra_indexes = Indexes,
@@ -1985,7 +1979,7 @@ normalize(#?MODULE{ra_indexes = Indexes,
                    release_cursors = Cursors} = State) ->
     State#?MODULE{
              ra_indexes = oqueue:from_list(oqueue:to_list(Indexes)),
-             returns = oqueue:from_list(oqueue:to_list(Returns)),
+             returns = lqueue:from_list(lqueue:to_list(Returns)),
              messages = lqueue:from_list(lqueue:to_list(Messages)),
              release_cursors = lqueue:from_list(lqueue:to_list(Cursors))}.
 
@@ -2059,80 +2053,62 @@ make_purge_nodes(Nodes) ->
 make_update_config(Config) ->
     #update_config{config = Config}.
 
-add_bytes_enqueue(Bytes,
-                  #?MODULE{msg_bytes_enqueue = Enqueue} = State)
- when is_integer(Bytes) ->
-    State#?MODULE{msg_bytes_enqueue = Enqueue + Bytes};
-add_bytes_enqueue(#{size := Bytes}, State) ->
-    add_bytes_enqueue(Bytes, State).
+add_bytes_enqueue(Header,
+                  #?MODULE{msg_bytes_enqueue = Enqueue} = State) ->
+    Size = get_header(size, Header),
+    State#?MODULE{msg_bytes_enqueue = Enqueue + Size}.
 
-add_bytes_drop(Bytes,
-               #?MODULE{msg_bytes_enqueue = Enqueue} = State)
-  when is_integer(Bytes) ->
-    State#?MODULE{msg_bytes_enqueue = Enqueue - Bytes};
-add_bytes_drop(#{size := Bytes}, State) ->
-    add_bytes_drop(Bytes, State).
+add_bytes_drop(Header,
+               #?MODULE{msg_bytes_enqueue = Enqueue} = State) ->
+    Size = get_header(size, Header),
+    State#?MODULE{msg_bytes_enqueue = Enqueue - Size}.
 
-add_bytes_checkout(Bytes,
+
+add_bytes_checkout(Header,
                    #?MODULE{msg_bytes_checkout = Checkout,
-                            msg_bytes_enqueue = Enqueue } = State)
-  when is_integer(Bytes) ->
-    State#?MODULE{msg_bytes_checkout = Checkout + Bytes,
-                  msg_bytes_enqueue = Enqueue - Bytes};
-add_bytes_checkout(#{size := Bytes}, State) ->
-    add_bytes_checkout(Bytes, State).
+                            msg_bytes_enqueue = Enqueue } = State) ->
+    Size = get_header(size, Header),
+    State#?MODULE{msg_bytes_checkout = Checkout + Size,
+                  msg_bytes_enqueue = Enqueue - Size}.
 
-add_bytes_settle(Bytes,
-                 #?MODULE{msg_bytes_checkout = Checkout} = State)
-  when is_integer(Bytes) ->
-    State#?MODULE{msg_bytes_checkout = Checkout - Bytes};
-add_bytes_settle(#{size := Bytes}, State) ->
-    add_bytes_settle(Bytes, State).
+add_bytes_settle(Header,
+                 #?MODULE{msg_bytes_checkout = Checkout} = State) ->
+    Size = get_header(size, Header),
+    State#?MODULE{msg_bytes_checkout = Checkout - Size}.
 
-add_bytes_return(Bytes,
+add_bytes_return(Header,
                  #?MODULE{msg_bytes_checkout = Checkout,
-                          msg_bytes_enqueue = Enqueue} = State)
-  when is_integer(Bytes) ->
-    State#?MODULE{msg_bytes_checkout = Checkout - Bytes,
-                  msg_bytes_enqueue = Enqueue + Bytes};
-add_bytes_return(#{size := Bytes}, State) ->
-    add_bytes_return(Bytes, State).
+                          msg_bytes_enqueue = Enqueue} = State) ->
+    Size = get_header(size, Header),
+    State#?MODULE{msg_bytes_checkout = Checkout - Size,
+                  msg_bytes_enqueue = Enqueue + Size}.
 
-add_in_memory_counts(Bytes,
+add_in_memory_counts(Header,
                      #?MODULE{msg_bytes_in_memory = InMemoryBytes,
-                              msgs_ready_in_memory = InMemoryCount} = State)
-  when is_integer(Bytes) ->
-    State#?MODULE{msg_bytes_in_memory = InMemoryBytes + Bytes,
-                  msgs_ready_in_memory = InMemoryCount + 1};
-add_in_memory_counts(#{size := Bytes}, State) ->
-    add_in_memory_counts(Bytes, State).
+                              msgs_ready_in_memory = InMemoryCount} = State) ->
+    Size = get_header(size, Header),
+    State#?MODULE{msg_bytes_in_memory = InMemoryBytes + Size,
+                  msgs_ready_in_memory = InMemoryCount + 1}.
 
-subtract_in_memory_counts(Bytes,
+subtract_in_memory_counts(Header,
                           #?MODULE{msg_bytes_in_memory = InMemoryBytes,
-                                   msgs_ready_in_memory = InMemoryCount} = State)
-  when is_integer(Bytes) ->
-    State#?MODULE{msg_bytes_in_memory = InMemoryBytes - Bytes,
-                  msgs_ready_in_memory = InMemoryCount - 1};
-subtract_in_memory_counts(#{size := Bytes}, State) ->
-    subtract_in_memory_counts(Bytes, State).
+                                   msgs_ready_in_memory = InMemoryCount} = State) ->
+    Size = get_header(size, Header),
+    State#?MODULE{msg_bytes_in_memory = InMemoryBytes - Size,
+                  msgs_ready_in_memory = InMemoryCount - 1}.
 
 message_size(#basic_message{content = Content}) ->
     #content{payload_fragments_rev = PFR} = Content,
     iolist_size(PFR);
-message_size(?PREFIX_MEM_MSG(H)) ->
-    get_size_from_header(H);
-message_size(?PREFIX_DISK_MSG(H)) ->
-    get_size_from_header(H);
+message_size(?PREFIX_MEM_MSG(Header)) ->
+    get_header(size, Header);
+message_size(?DISK_MSG(Header)) ->
+    get_header(size, Header);
 message_size(B) when is_binary(B) ->
     byte_size(B);
 message_size(Msg) ->
     %% probably only hit this for testing so ok to use erts_debug
     erts_debug:size(Msg).
-
-get_size_from_header(Size) when is_integer(Size) ->
-    Size;
-get_size_from_header(#{size := B}) ->
-    B.
 
 
 all_nodes(#?MODULE{consumers = Cons0,
@@ -2233,13 +2209,13 @@ convert(1, To, State0) ->
     convert(2, To, convert_v1_to_v2(State0)).
 
 smallest_raft_index(#?MODULE{cfg = _Cfg,
-                             ra_indexes = Indexes
-                            }) ->
-    case oqueue:peek(Indexes) of
-        {value, I, _} ->
-                  I;
+                             ra_indexes = Indexes0
+                            } = State) ->
+    case oqueue:peek(Indexes0) of
+        {value, I, Indexes} ->
+            {I, State#?MODULE{ra_indexes = Indexes}};
         _ ->
-            undefined
+            {undefined, State}
     end.
 
 % consumer_messages(#?MODULE{consumers = Consumers}) ->

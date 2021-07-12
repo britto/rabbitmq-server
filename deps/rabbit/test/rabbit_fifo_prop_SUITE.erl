@@ -54,6 +54,8 @@ all_tests() ->
      scenario26,
      scenario27,
      scenario28,
+     scenario29,
+     scenario30,
      single_active,
      single_active_01,
      single_active_02,
@@ -364,7 +366,7 @@ scenario20(_Config) ->
     C1 = {<<>>, C1Pid},
     E = c:pid(0,176,1),
     Commands = [make_enqueue(E,1,<<>>),
-                make_enqueue(E,2,<<>>),
+                make_enqueue(E,2,<<1>>),
                 make_checkout(C1, {auto,2,simple_prefetch}),
                 {down, C1Pid, noconnection},
                 make_enqueue(E,3,<<0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0>>),
@@ -374,7 +376,8 @@ scenario20(_Config) ->
                 make_enqueue(E,7,<<0,0,0,0,0,0,0,0,0,0,0,0,0,0>>)
                ],
     run_snapshot_test(#{name => ?FUNCTION_NAME,
-                        max_bytes => 97,
+                        max_length => 4,
+                        % max_bytes => 97,
                         max_in_memory_length => 1}, Commands),
     ok.
 
@@ -567,6 +570,54 @@ scenario27(_Config) ->
                            }, Commands, false)),
     ok.
 
+scenario30(_Config) ->
+    C1Pid = c:pid(0,242,0),
+    C1 = {<<>>, C1Pid},
+    E = c:pid(0,240,0),
+    Commands = [
+                make_enqueue(E,1,<<>>), %% 1
+                make_enqueue(E,2,<<1>>), %% 2
+                make_checkout(C1, {auto,1,simple_prefetch}), %% 3
+                {down, C1Pid, noconnection}, %% 4
+                make_enqueue(E,3,<<>>) %% 5
+               ],
+    run_snapshot_test(#{name => ?FUNCTION_NAME,
+                        release_cursor_interval => 0,
+                        deliver_limit => undefined,
+                        max_length => 1,
+                        max_in_memory_length => 1,
+                        overflow_strategy => drop_head,
+                        dead_letter_handler => {?MODULE, banana, []},
+                        single_active_consumer_on => true
+                       },
+                      Commands),
+    ok.
+scenario29(_Config) ->
+    C1Pid = c:pid(0,242,0),
+    C1 = {<<>>, C1Pid},
+    E = c:pid(0,240,0),
+    Commands = [
+                make_enqueue(E,1,<<>>), %% 1
+                make_enqueue(E,2,<<>>), %% 2
+                make_checkout(C1, {auto,2,simple_prefetch}), %% 2
+                make_enqueue(E,3,<<>>), %% 3
+                make_enqueue(E,4,<<>>), %% 4
+                make_enqueue(E,5,<<>>), %% 5
+                make_enqueue(E,6,<<>>), %% 6
+                make_enqueue(E,7,<<>>), %% 7
+                {down, E, noconnection} %% 8
+               ],
+    run_snapshot_test(#{name => ?FUNCTION_NAME,
+                        release_cursor_interval => 0,
+                        deliver_limit => undefined,
+                        max_length => 5,
+                        max_in_memory_length => 1,
+                        overflow_strategy => drop_head,
+                        dead_letter_handler => {?MODULE, banana, []},
+                        single_active_consumer_on => true
+                       },
+                      Commands),
+    ok.
 scenario23(_Config) ->
     C1Pid = c:pid(0,242,0),
     C1 = {<<>>, C1Pid},
@@ -987,7 +1038,7 @@ single_active_prop(Conf0, Commands, ValidateOrder) ->
                         map_size(Up) =< 1
                 end,
 
-    ct:pal("State: ~p~n ~p~n", [Conf, Entries]),
+    % ct:pal("State: ~p~n ~p~n", [Conf, Entries]),
     try run_log(test_init(Conf), Entries, Invariant) of
         {_State, Effects} when ValidateOrder ->
             % ct:pal("Effects: ~p~n", [Effects]),
@@ -999,10 +1050,8 @@ single_active_prop(Conf0, Commands, ValidateOrder) ->
                             (_, Acc) ->
                                 Acc
                         end, -1, Effects),
-            ct:pal("Run complete"),
             true;
         _ ->
-            ct:pal("Run complete"),
             true
     catch
         Err ->
@@ -1353,7 +1402,6 @@ run_snapshot_test0(Conf, Commands) ->
     {State0, Effects} = run_log(test_init(Conf), Entries),
     State = rabbit_fifo:normalize(State0),
     Cursors = [ C || {release_cursor, _, _} = C <- Effects],
-    % ct:pal("Cursors ~p", [Cursors]),
 
     [begin
          %% drop all entries below and including the snapshot
